@@ -1,0 +1,19 @@
+/build/
+/build-*/
+*.log
+*.csv
+*.bin
+*.o
+*.obj
+*.exe
+*.dll
+*.pdb
+
+# Investigation-only tools retained locally but not part of the public fixer.
+/GuardStub.S
+/Host.cpp
+/LocalCompGuardStub.S
+/LocalCompHost.cpp
+/OverlapYawHost.cpp
+/PhaseHost.cpp
+/PhaseStubs.S
