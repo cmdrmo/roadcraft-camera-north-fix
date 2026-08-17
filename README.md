@@ -34,6 +34,20 @@ Do not force-terminate the fixer while the patch is active. If restoration ever
 fails, leave the fixer open and exit RoadCraft; process exit discards all
 temporary memory.
 
+## Known issue: rare horizontal-camera lock
+
+In at least one observed state, v0.1.0 entered a feedback loop and rebased every
+camera update (approximately 100 times per second). Horizontal camera movement
+then appeared locked, while vertical movement remained available.
+
+If the **Rebases** counter increases continuously instead of only occasionally,
+click **Stop and restore** immediately. The observed session restored the
+original bytes successfully and the game remained responsive. Exiting RoadCraft
+also discards the runtime patch.
+
+This means v0.1.0 is useful as an experimental workaround, but is not yet a
+complete fix. The feedback state is under investigation.
+
 ## What it fixes
 
 The bad local-yaw value is produced by an overlapping 64-bit copy on the normal

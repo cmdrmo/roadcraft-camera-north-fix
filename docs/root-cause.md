@@ -79,3 +79,27 @@ RoadCraft.
 
 These results establish a strong causal link for the tested build; they do not
 prove compatibility with later builds or every hardware/configuration variant.
+
+## Known feedback-lock state
+
+A later session exposed a failure mode that the bounded A/B tests did not hit.
+After 129 seconds of normal operation, the fixer began classifying essentially
+every camera-path write as anomalous:
+
+- Final path writes: 15,653
+- Consecutive anomaly/rebase events: 2,679
+- Sustained rebase rate: approximately 95-107 per second
+- Visible result: horizontal camera lock; vertical movement unaffected
+- Recovery: **Stop and restore** restored the original bytes successfully; the
+  game process remained responsive
+
+The current canonical-rebase intervention repairs the destination local-yaw
+representation but not the upstream state that generated the bad candidate. In
+this newly observed state, the upstream candidate remains on the bad branch and
+the guard preserves the previous direction every update, creating a feedback
+loop.
+
+This does not invalidate localization of the overlapping writer, but it does
+show that destination-only canonical rebasing is not a complete repair. A future
+version should either repair the upstream source state or provide a bounded
+escape/convergence path instead of indefinitely retaining the old yaw.
