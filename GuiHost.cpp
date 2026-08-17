@@ -14,11 +14,11 @@
 
 namespace {
 constexpr wchar_t WindowClassName[] = L"RoadCraftCameraNorthFixWindow";
-constexpr wchar_t WindowTitle[] = L"RoadCraft Camera North Fix v0.1.0";
+constexpr wchar_t WindowTitle[] = L"RoadCraft Camera North Fix v0.2.0";
 constexpr UINT_PTR UiTimer = 1;
-constexpr std::uintptr_t HookRva = 0x009E6123;
+constexpr std::uintptr_t HookRva = 0x009E60E4;
 constexpr std::uintptr_t RelayRva = 0x009E8561;
-constexpr std::array<std::uint8_t, 8> ExpectedHook{0x49, 0x89, 0x46, 0x04, 0x41, 0xC6, 0x07, 0x01};
+constexpr std::array<std::uint8_t, 5> ExpectedHook{0xF3, 0x0F, 0x5C, 0x4F, 0x04};
 constexpr std::array<std::uint8_t, 14> ExpectedRelay{
     0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
     0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC};
@@ -36,15 +36,29 @@ enum ControlId : int {
 
 struct State {
     std::uint32_t totalWrites;
-    std::uint32_t rebasedWrites;
+    std::uint32_t wrappedFrames;
     std::uint32_t over20;
-    std::uint32_t eventIndex;
+    std::uint32_t positiveWraps;
     std::uint32_t maximumDeltaBits;
-    std::uint32_t rebaseEnabled;
-    std::uint32_t replacementBits;
-    std::uint32_t reserved;
+    std::uint32_t wrapEnabled;
+    std::uint32_t negativeWraps;
+    std::uint32_t currentRun;
+    std::uint32_t transitionCount;
+    std::int32_t transitionDirection;
+    std::uint32_t transitionDesiredBits;
+    std::uint32_t transitionCurrentBits;
+    std::uint32_t transitionRawBits;
+    std::uint32_t transitionWrappedBits;
+    std::uint32_t transitionPreviousDesiredBits;
+    std::uint32_t transitionPreviousCurrentBits;
+    std::uint32_t lastDesiredBits;
+    std::uint32_t lastCurrentBits;
+    std::uint32_t lastRawBits;
+    std::uint32_t lastWrappedBits;
+    std::uint32_t previousDesiredBits;
+    std::uint32_t previousCurrentBits;
 };
-static_assert(sizeof(State) == 32);
+static_assert(sizeof(State) == 88);
 
 struct Session {
     HANDLE process{};
@@ -56,7 +70,7 @@ struct Session {
     std::size_t remoteSize{};
     std::size_t stateOffset{};
     State state{};
-    std::uint32_t lastLoggedRebases{};
+    std::uint32_t lastLoggedTransitions{};
     bool active{};
 };
 
@@ -169,7 +183,7 @@ std::size_t FindStateOffset(const std::vector<std::uint8_t>& blob) {
 }
 
 bool ValidateBytes(HANDLE process, std::uintptr_t module) {
-    std::array<std::uint8_t, 8> hook{};
+    std::array<std::uint8_t, ExpectedHook.size()> hook{};
     std::array<std::uint8_t, 14> relay{};
     return ReadExact(process, module + HookRva, hook) && hook == ExpectedHook &&
         ReadExact(process, module + RelayRva, relay) && relay == ExpectedRelay;
@@ -184,10 +198,12 @@ void ShowState(const State& state) {
     std::wostringstream text;
     text.setf(std::ios::fixed);
     text.precision(3);
-    text << L"Writes: " << state.totalWrites
-         << L"    Anomalies: " << state.over20
-         << L"    Rebases: " << state.rebasedWrites
-         << L"    Max raw jump: " << std::bit_cast<float>(state.maximumDeltaBits) << L"°";
+    text << L"Yaw deltas: " << state.totalWrites
+         << L"    Wrapped frames: " << state.wrappedFrames
+         << L" (+" << state.positiveWraps << L"/-" << state.negativeWraps << L")"
+         << L"    Current run: " << state.currentRun
+         << L"    Raw: " << std::bit_cast<float>(state.lastRawBits)
+         << L"° -> " << std::bit_cast<float>(state.lastWrappedBits) << L"°";
     SetWindowTextW(gStats, text.str().c_str());
 }
 
@@ -244,7 +260,7 @@ bool StartFix() {
     std::array<std::uint8_t, 14> relayPatch{0xFF, 0x25, 0, 0, 0, 0};
     const auto remoteAddress = reinterpret_cast<std::uint64_t>(remote);
     std::memcpy(relayPatch.data() + 6, &remoteAddress, sizeof(remoteAddress));
-    std::array<std::uint8_t, 8> hookPatch{0xE8, 0, 0, 0, 0, 0x90, 0x90, 0x90};
+    std::array<std::uint8_t, 5> hookPatch{0xE8, 0, 0, 0, 0};
     const auto displacement = static_cast<std::int32_t>(
         static_cast<std::int64_t>(relay) - static_cast<std::int64_t>(hook + 5));
     std::memcpy(hookPatch.data() + 1, &displacement, sizeof(displacement));
@@ -261,11 +277,11 @@ bool StartFix() {
     }
 
     gSession = {process, pid, module, hook, relay, remote, blob.size(), stateOffset, {}, 0, true};
-    SetWindowTextW(gStatus, L"Fix enabled (canonical rebase)");
+    SetWindowTextW(gStatus, L"Fix enabled (wrapped yaw delta)");
     SetWindowTextW(gProcess, (L"PID " + std::to_wstring(pid) + L"    " + gamePath).c_str());
     ShowState({});
     UpdateButtons();
-    AppendLog(L"Canonical-rebase fix installed. PID=" + std::to_wstring(pid));
+    AppendLog(L"Wrapped-yaw delta fix installed. PID=" + std::to_wstring(pid));
     return true;
 }
 
@@ -304,8 +320,9 @@ bool StopFix(bool gameAlreadyExited = false) {
 
     if (stateRead) {
         AppendLog(L"Stopped and restored. writes=" + std::to_wstring(finalState.totalWrites) +
-            L" anomalies=" + std::to_wstring(finalState.over20) +
-            L" rebased=" + std::to_wstring(finalState.rebasedWrites));
+            L" over20=" + std::to_wstring(finalState.over20) +
+            L" wrapped=" + std::to_wstring(finalState.wrappedFrames) +
+            L" runs=" + std::to_wstring(finalState.transitionCount));
     } else {
         AppendLog(L"Stopped and restored; final counters could not be read.");
     }
@@ -328,11 +345,22 @@ void Poll() {
                 &state, sizeof(state), &read) && read == sizeof(state)) {
             gSession.state = state;
             ShowState(state);
-            if (state.rebasedWrites != gSession.lastLoggedRebases) {
-                const auto increase = state.rebasedWrites - gSession.lastLoggedRebases;
-                gSession.lastLoggedRebases = state.rebasedWrites;
-                AppendLog(L"Rebased " + std::to_wstring(increase) +
-                    L" new event(s); total " + std::to_wstring(state.rebasedWrites));
+            if (state.transitionCount != gSession.lastLoggedTransitions) {
+                const auto increase = state.transitionCount - gSession.lastLoggedTransitions;
+                gSession.lastLoggedTransitions = state.transitionCount;
+                std::wostringstream event;
+                event.setf(std::ios::fixed);
+                event.precision(3);
+                event << L"New wrap run(s): " << increase
+                      << L"; latest #" << state.transitionCount
+                      << L" dir=" << (state.transitionDirection > 0 ? L"+" : L"-")
+                      << L" prev(des=" << std::bit_cast<float>(state.transitionPreviousDesiredBits)
+                      << L",cur=" << std::bit_cast<float>(state.transitionPreviousCurrentBits) << L")"
+                      << L" desired=" << std::bit_cast<float>(state.transitionDesiredBits)
+                      << L" current=" << std::bit_cast<float>(state.transitionCurrentBits)
+                      << L" raw=" << std::bit_cast<float>(state.transitionRawBits)
+                      << L" wrapped=" << std::bit_cast<float>(state.transitionWrappedBits);
+                AppendLog(event.str());
             }
         }
         return;
@@ -362,33 +390,33 @@ void ApplyFont(HWND window) {
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_CREATE: {
-        CreateWindowW(L"STATIC", L"RoadCraft Camera North Fix v0.1.0",
-            WS_CHILD | WS_VISIBLE, 20, 16, 620, 28, window, nullptr, gInstance, nullptr);
+        CreateWindowW(L"STATIC", L"RoadCraft Camera North Fix v0.2.0",
+            WS_CHILD | WS_VISIBLE, 20, 16, 845, 28, window, nullptr, gInstance, nullptr);
         CreateWindowW(L"STATIC", L"Status:", WS_CHILD | WS_VISIBLE,
             20, 55, 55, 22, window, nullptr, gInstance, nullptr);
         gStatus = CreateWindowW(L"STATIC", L"Initializing", WS_CHILD | WS_VISIBLE,
-            78, 55, 555, 22, window, reinterpret_cast<HMENU>(StatusText), gInstance, nullptr);
+            78, 55, 780, 22, window, reinterpret_cast<HMENU>(StatusText), gInstance, nullptr);
         CreateWindowW(L"STATIC", L"Process:", WS_CHILD | WS_VISIBLE,
             20, 83, 55, 22, window, nullptr, gInstance, nullptr);
         gProcess = CreateWindowW(L"STATIC", L"Not detected", WS_CHILD | WS_VISIBLE | SS_PATHELLIPSIS,
-            78, 83, 555, 22, window, reinterpret_cast<HMENU>(ProcessText), gInstance, nullptr);
+            78, 83, 780, 22, window, reinterpret_cast<HMENU>(ProcessText), gInstance, nullptr);
         gStart = CreateWindowW(L"BUTTON", L"Enable fix", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
             20, 118, 135, 34, window, reinterpret_cast<HMENU>(StartButton), gInstance, nullptr);
         gStop = CreateWindowW(L"BUTTON", L"Stop and restore", WS_CHILD | WS_VISIBLE,
             166, 118, 135, 34, window, reinterpret_cast<HMENU>(StopButton), gInstance, nullptr);
         CreateWindowW(L"STATIC", L"Closing normally restores the patch. On failure, exit the game.",
-            WS_CHILD | WS_VISIBLE, 320, 126, 315, 22, window, nullptr, gInstance, nullptr);
-        gStats = CreateWindowW(L"STATIC", L"Writes: 0    Anomalies: 0    Rebases: 0    Max raw jump: 0°",
-            WS_CHILD | WS_VISIBLE, 20, 167, 615, 24, window,
+            WS_CHILD | WS_VISIBLE, 320, 126, 540, 22, window, nullptr, gInstance, nullptr);
+        gStats = CreateWindowW(L"STATIC", L"Yaw deltas: 0    Wrapped frames: 0 (+0/-0)    Current run: 0    Raw: 0° -> 0°",
+            WS_CHILD | WS_VISIBLE, 20, 167, 840, 24, window,
             reinterpret_cast<HMENU>(StatsText), gInstance, nullptr);
         CreateWindowW(L"STATIC", L"Runtime log:", WS_CHILD | WS_VISIBLE,
             20, 200, 100, 22, window, nullptr, gInstance, nullptr);
         gLog = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
-            20, 225, 615, 245, window, reinterpret_cast<HMENU>(LogText), gInstance, nullptr);
+            20, 225, 840, 245, window, reinterpret_cast<HMENU>(LogText), gInstance, nullptr);
         EnumChildWindows(window, [](HWND child, LPARAM) -> BOOL { ApplyFont(child); return TRUE; }, 0);
         UpdateButtons();
-        AppendLog(L"UI started. This build targets Steam build 23930923.");
+        AppendLog(L"UI started. v0.2 wraps yaw delta before camera smoothing.");
         SetTimer(window, UiTimer, 1000, nullptr);
         Poll();
         return 0;
@@ -432,7 +460,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     gInstance = instance;
     if (wcsstr(GetCommandLineW(), L"--self-test")) return SelfTest();
 
-    gSingleInstance = CreateMutexW(nullptr, FALSE, L"Local\\RoadCraftCameraNorthFix_v0_1_0");
+    gSingleInstance = CreateMutexW(nullptr, FALSE, L"Local\\RoadCraftCameraNorthFix_v0_2_0");
     if (!gSingleInstance || GetLastError() == ERROR_ALREADY_EXISTS) {
         MessageBoxW(nullptr, L"RoadCraft Camera North Fix is already running.",
             WindowTitle, MB_ICONINFORMATION | MB_OK);
@@ -458,7 +486,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
 
     gWindow = CreateWindowExW(0, WindowClassName, WindowTitle,
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 675, 525, nullptr, nullptr, instance, nullptr);
+        CW_USEDEFAULT, CW_USEDEFAULT, 900, 525, nullptr, nullptr, instance, nullptr);
     if (!gWindow) return 2;
     ShowWindow(gWindow, showCommand);
     UpdateWindow(gWindow);

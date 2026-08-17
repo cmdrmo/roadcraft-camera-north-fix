@@ -4,102 +4,124 @@ Investigation date: 2026-08-17
 
 ## Symptom
 
-Near North, the horizontal camera yaw sometimes jumps for approximately one
-frame and then returns through the game's normal smoothing. Pitch does not
-change. Both leftward and rightward jumps occur, commonly near 90 degrees.
+Near North, horizontal camera yaw can jump for approximately one frame and then
+return through normal smoothing. Pitch does not change. Both directions occur,
+commonly near 90 degrees. Vehicle rotation alone can trigger it in free-camera
+mode, and camera/vehicle alignment changes its probability.
 
-Reducing the camera slerp rate transformed the brief twitch into a visible
-rotational impulse and full-circle recovery. Vehicle rotation alone could
-trigger it in free-camera mode, and time spent near camera/vehicle alignment
-changed the probability.
+Reducing the camera slerp rate transformed the twitch into a rotational impulse
+or full-circle recovery. This was the first strong indication that the problem
+was an angle interpolation path rather than input or collision response.
 
-## Localization
+## Interpolation data flow
 
-The final target-yaw writer computes:
+The relevant path computes two adjacent camera components and later stores them
+as a qword. The yaw component is formed as follows:
+
+```text
+0x1409E60DB  movss xmm1, [rbx+0x5C]       ; desired yaw
+0x1409E60E0  subss xmm3, xmm0             ; smoothing factor
+0x1409E60E4  subss xmm1, [rdi+0x04]       ; desired - current
+0x1409E60F2  mulss xmm1, xmm3
+0x1409E60FA  addss xmm1, [rdi+0x04]
+0x1409E6103  movss [rsp+0x124], xmm1
+0x1409E611B  mov rax, [rsp+0x120]
+0x1409E6123  mov [r14+0x04], rax           ; paired-float store
+```
+
+At this point `[rdi+0x04]` is controller local yaw at `+0x68`. The subtraction
+does not normalize its cyclic difference before scalar interpolation.
+
+The final target writer later uses:
 
 ```text
 target_yaw(+0x54) = local_yaw(+0x68) + vehicle_yaw(+0x114A8)
 ```
 
-During real triggers, the vehicle value remained continuous while local yaw
-changed by roughly 160 degrees between an earlier continuous writer and this
-final calculation.
+Direct searches for float writes originally missed the qword store and led to
+an early interpretation that the overlapping high dword was accidental. The
+paired store is better understood as a compiler-generated two-float copy. The
+actual defect is the unwrapped subtraction that produces its yaw candidate.
 
-The missing writer was an overlapping qword copy at RVA `0x9E6123`:
+## Transition-frame proof
+
+A transition probe captured two independent entries into a persistent winding
+mismatch. In both, desired yaw remained continuous while current local yaw
+changed by approximately one negative turn.
 
 ```text
-0x1409E611B  mov rax, [rsp+0x120]
-0x1409E6123  mov [r14+0x04], rax
-0x1409E6127  mov byte ptr [r15], 1
+previous desired:    1.470
+previous current:    1.021
+current desired:     1.166
+current current:  -359.271
+raw delta:          360.437
+wrapped delta:        0.437
 ```
 
-Here `r14 == camera_controller + 0x60`, so the high half of the qword overwrites
-the float at `camera_controller + 0x68`.
+```text
+previous desired:   12.832
+previous current:   11.557
+current desired:    13.098
+current current:  -348.355
+raw delta:          361.454
+wrapped delta:        1.454
+```
 
-A direct observer recorded 6,628 normal-path writes and eight bad candidates in
-one trigger run. The maximum circular discontinuity was 163.555 degrees. An
-alternate overlapping writer at RVA `0x9E6138` executed zero times during a
-separate 60-second high-probability test.
+Afterward, the raw delta remained near `360 degrees` for thousands of frames
+while the equivalent wrapped delta remained near zero.
 
-## Rejected intervention
+A separate persistent state reached a maximum raw delta of `1085.820 degrees`,
+equivalent to only `5.820 degrees` after subtracting three complete turns.
 
-Simply retaining the previous high dword caused a feedback latch: 5,164 of
-6,419 writes were rejected, and horizontal camera movement intermittently
-locked while vertical movement remained available.
+## Failed v0.1 intervention
 
-## Canonical rebase
+The first public experiment detected a large final target discontinuity at RVA
+`0x9E6123` and retained an equivalent previous local yaw. It prevented ordinary
+transient twitches, but in a persistent winding mismatch it rejected every
+final write and produced horizontal camera lock while pitch remained available.
 
-For candidates whose resulting circular world-yaw discontinuity exceeds 20
-degrees, the working fix:
+One reproduced lock session recorded 2,679 consecutive interventions at roughly
+95-107 camera updates per second. Restoring the original bytes unlocked the
+camera. This established that destination-side holding was not a complete fix.
 
-1. performs the original low-dword write;
-2. replaces the high dword with the previous local yaw normalized into
-   `[-180, +180]`;
-3. performs the original state-byte write.
+## v0.2 wrapped-delta intervention
 
-This keeps the same circular direction while giving subsequent updates a
-canonical representation, avoiding the feedback latch.
+v0.2 hooks the five-byte subtraction at RVA `0x9E60E4`, executes it, and wraps
+the resulting `xmm1` delta into `[-180,+180]`. The original smoothing, paired
+write, state byte, and downstream target calculation then execute normally.
 
-In a bounded test, the hook observed 6,587 writes and corrected 20 independent
-events. The maximum bad candidate was 161.299 degrees; the circular error of the
-replacement was approximately zero for every event.
+The hook preserves CPU flags that remain live across this region. It does not
+modify pitch, reject final writes, retain a destination value, or use a shared
+replacement-angle scratch field.
 
-## Standalone UI A/B test
+## Validation
 
-Two complete enable/restore cycles produced:
+Four complete enable/restore sessions observed:
 
-| Cycle | Path writes | Bad candidates | Rebases | Operator result |
-| --- | ---: | ---: | ---: | --- |
-| 1 | 6,735 | 15 | 15 | Twitch absent while enabled; returned after restore |
-| 2 | 2,608 | 7 | 7 | Twitch absent while enabled; returned after restore |
+| Session | Path writes | Wrapped frames |
+| --- | ---: | ---: |
+| 1 | 57,481 | 42,522 |
+| 2 | 15,472 | 11,444 |
+| 3 | 6,672 | 3,949 |
+| 4 | 2,492 | 240 |
+| **Total** | **82,117** | **58,155** |
 
-The standalone fixer therefore corrected 22 additional independent anomalies.
-It was also successfully applied to a fresh game process after restarting
-RoadCraft.
+No twitch or horizontal lock was observed while v0.2 was enabled. Both wrap
+directions were exercised in one session (`+340 / -3407`) without visible
+failure. Persistent per-frame wrapping also remained stable.
 
-These results establish a strong causal link for the tested build; they do not
-prove compatibility with later builds or every hardware/configuration variant.
+When the original subtraction was restored during a persistent mismatch, the
+camera twitched immediately. Restoring it after a transient run had ended did
+not twitch. This provides a direct A/B link between the unwrapped subtraction
+and the visible failure.
 
-## Known feedback-lock state
+All tested stop operations restored the original hook and relay bytes, released
+the temporary allocation, and left the game responsive.
 
-A later session exposed a failure mode that the bounded A/B tests did not hit.
-After 129 seconds of normal operation, the fixer began classifying essentially
-every camera-path write as anomalous:
+## Remaining limits
 
-- Final path writes: 15,653
-- Consecutive anomaly/rebase events: 2,679
-- Sustained rebase rate: approximately 95-107 per second
-- Visible result: horizontal camera lock; vertical movement unaffected
-- Recovery: **Stop and restore** restored the original bytes successfully; the
-  game process remained responsive
-
-The current canonical-rebase intervention repairs the destination local-yaw
-representation but not the upstream state that generated the bad candidate. In
-this newly observed state, the upstream candidate remains on the bad branch and
-the guard preserves the previous direction every update, creating a feedback
-loop.
-
-This does not invalidate localization of the overlapping writer, but it does
-show that destination-only canonical rebasing is not a complete repair. A future
-version should either repair the upstream source state or provide a bounded
-escape/convergence path instead of indefinitely retaining the old yaw.
+The workaround is validated only for Steam build `23930923` on the original
+investigator's system. It is intentionally guarded by exact instruction and
+relay-byte checks. Wider hardware and long-duration community testing remain
+useful, and every future game build must be revalidated before offsets are
+updated.

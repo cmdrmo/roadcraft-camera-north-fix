@@ -4,9 +4,9 @@ An experimental, reversible runtime fix for the horizontal camera twitch that
 can occur near North in RoadCraft.
 
 The visible failure is usually a one-frame yaw jump followed by the normal
-camera smoothing pulling the view back. Lowering the game's camera slerp rate
-made the same failure look like a rotational impulse, which made the faulty
-state transition easier to trace.
+camera smoothing pulling the view back. Pitch is unaffected. Both jump
+directions occur, and lowering the camera slerp rate turns the brief twitch into
+a rotational impulse or full-circle recovery.
 
 ## Compatibility
 
@@ -24,68 +24,73 @@ If a game update changes them, it refuses to install instead of guessing.
 2. Run `RoadCraftCameraFixUI.exe`.
 3. Confirm that the UI says the game bytes match.
 4. Click **Enable fix**.
-5. Before closing the fixer, click **Stop and restore**, or close the window
-   normally and let it restore the original bytes.
+5. Click **Stop and restore**, or close the window normally, to remove the
+   runtime patch.
 
-The fixer does not modify game files or save data. The patch exists only in the
-current game process. Restarting RoadCraft requires enabling it again.
+The fixer does not modify game files or save data. Restarting RoadCraft requires
+enabling it again.
 
-Do not force-terminate the fixer while the patch is active. If restoration ever
+Do not force-terminate the fixer while its patch is active. If restoration ever
 fails, leave the fixer open and exit RoadCraft; process exit discards all
 temporary memory.
 
-## Known issue: rare horizontal-camera lock
+## What v0.2 fixes
 
-In at least one observed state, v0.1.0 entered a feedback loop and rebased every
-camera update (approximately 100 times per second). Horizontal camera movement
-then appeared locked, while vertical movement remained available.
-
-If the **Rebases** counter increases continuously instead of only occasionally,
-click **Stop and restore** immediately. The observed session restored the
-original bytes successfully and the game remained responsive. Exiting RoadCraft
-also discards the runtime patch.
-
-This means v0.1.0 is useful as an experimental workaround, but is not yet a
-complete fix. The feedback state is under investigation.
-
-## What it fixes
-
-The bad local-yaw value is produced by an overlapping 64-bit copy on the normal
-camera update path:
+RoadCraft stores yaw as an accumulating angle, so equivalent headings can be
+represented on different 360-degree winding layers. The affected camera path
+interpolates those values using ordinary scalar subtraction:
 
 ```text
-Roadcraft - Retail.exe+0x9E611B  mov rax, [rsp+0x120]
-Roadcraft - Retail.exe+0x9E6123  mov [r14+0x04], rax
-Roadcraft - Retail.exe+0x9E6127  mov byte ptr [r15], 1
+delta  = desired_yaw - current_yaw
+result = current_yaw + delta * smoothing_factor
 ```
 
-At this site, `r14 == camera_controller + 0x60`. The low dword goes to `+0x64`,
-while the high dword unintentionally becomes the horizontal local-yaw state at
-`+0x68`. This is why searches limited to direct float stores missed the writer.
+When one state is `1 degree` and the other is `-359 degrees`, ordinary
+subtraction produces a full-circle `360-degree` delta even though both headings
+are equivalent. v0.2 replaces only that subtraction at RVA `0x9E60E4`. It
+executes the original instruction and normalizes the delta into `[-180,+180]`
+before the game's original smoothing and writeback continue.
 
-When that candidate would create a circular world-yaw discontinuity above 20
-degrees, the fix still performs the low-dword write but replaces the high dword
-with the previous yaw normalized into `[-180, +180]`. For example, `359.7` is
-rebased to the equivalent `-0.3`. This preserves the camera direction without
-freezing horizontal movement.
+```text
+raw delta 360.437 degrees  ->  wrapped delta 0.437 degrees
+raw delta 1085.820 degrees ->  wrapped delta 5.820 degrees
+```
 
-See [docs/root-cause.md](docs/root-cause.md) for the observations and A/B test
-results.
+See [docs/root-cause.md](docs/root-cause.md) for the disassembly, transition
+captures, failed v0.1 intervention, and validation results.
 
-## Safety and limitations
+## Understanding the counters
 
-- This is an unofficial community workaround, not a Saber Interactive product.
+`Wrapped frames` is not a count of visible camera twitches. It counts frames in
+which two equivalent yaw states occupy different winding layers. The counter
+may increase continuously while the camera remains completely stable; this is
+expected.
+
+`Current run` returns to zero after a transient boundary crossing. It continues
+to grow when the game retains a persistent winding mismatch. Both positive and
+negative wrap directions have been observed and corrected without visible
+twitching or horizontal lock.
+
+## Known limitations
+
+- This is an unofficial community workaround, not a Saber Interactive or Focus
+  Entertainment product.
 - It opens the RoadCraft process and temporarily writes executable memory.
   Antivirus products may flag that behavior even though the source is public.
 - It is intentionally build-specific. A future game update will normally show
-  **version mismatch** until the offsets and surrounding code are revalidated.
-- It has only been tested by the original investigator so far.
-- No network access or telemetry is implemented. A UTF-8 log is written beside
-  the executable.
+  **version mismatch** until the code is revalidated.
+- If the fix is stopped during a persistent winding mismatch, the first frame
+  restored to RoadCraft's original subtraction may visibly twitch once. This
+  does not damage the game; enabling the fix again resumes wrapped interpolation.
+- Testing so far has been performed by the original investigator on one system.
+
+The v0.1 destination guard could enter a feedback loop and lock horizontal
+camera movement. It has been replaced by the source-level wrapped-delta fix in
+v0.2 and should no longer be used.
 
 ## Building
 
-The current build uses MinGW-w64, CMake, Ninja, GNU assembler, and `objcopy`:
+The build uses MinGW-w64, CMake, Ninja, GNU assembler, and `objcopy`:
 
 ```powershell
 cmake -S . -B build -G Ninja `
@@ -96,19 +101,14 @@ cmake -S . -B build -G Ninja `
 cmake --build build
 ```
 
-The output is a statically linked single-file Win32 executable:
+The result is a statically linked single-file Win32 executable:
 `build/RoadCraftCameraFixUI.exe`.
 
 ## Reporting results
 
-Please include:
-
-- Steam build ID and game file version;
-- whether the UI accepted or rejected the version bytes;
-- the `writes`, `anomalies`, and `rebased` counters;
-- whether the twitch was absent while enabled and returned after restoration.
-
-Please do not upload game binaries, save files, or crash dumps.
+Please include the Steam build ID, whether version validation passed, the UI
+counters, and whether the camera remained stable across vehicles, camera modes,
+and scene transitions. Do not upload game binaries, save files, or crash dumps.
 
 ## License
 
