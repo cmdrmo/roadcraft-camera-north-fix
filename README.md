@@ -1,5 +1,13 @@
 # RoadCraft Camera North Fix
 
+## Official camera fix shipped in RoadCraft 7.2
+
+Saber released Update 7.2 on September 10, 2026. The [official patch notes](https://steamcommunity.com/games/2104890/announcements/detail/686389990174753840) list **“Fixed camera jerking at certain settings.”** Update the game and use the official fix first.
+
+**This workaround is for the old 7.1 build only. It has not been ported to 7.2 and should not be used with 7.2 or later.** The source, release and original investigation remain available as a historical reference.
+
+Brief local checks on 7.2 (Steam build `25119957`) did not reproduce the reported twitch. Static inspection also found changes to upstream camera reference-frame/settings handling, while the original unwrapped interpolation remains. We have not conclusively established that the official fix covers every North-twitch trigger documented here, or identified its exact causal implementation.
+
 An experimental, reversible runtime fix for the horizontal camera twitch that
 can occur near North in RoadCraft.
 
